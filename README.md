@@ -4,14 +4,13 @@ Non-blocking NeoPixel driver for ESP32 using the RMT hardware peripheral.
 
 ## Why?
 
-The Adafruit NeoPixel library disables interrupts during `show()` for ~720µs, which causes glitches in real-time audio and other timing-sensitive applications. NeoPixelRMT uses the ESP32's RMT peripheral to transmit LED data asynchronously — `show()` returns immediately while the hardware handles the rest.
+Other NeoPixel libraries can disable interrupts during `show()`, which causes glitches in real-time audio and other timing-sensitive applications. NeoPixelRMT uses the ESP32's RMT peripheral to transmit LED data asynchronously — `show()` returns immediately while the hardware handles the rest.
 
 ## Features
 
 - Drop-in replacement for Adafruit_NeoPixel API
 - Non-blocking `show()` via `rmtWriteAsync()`
 - Supports RGB, GRB, RGBW, and GRBW color orders
-- Header-only — no `.cpp` files to compile
 - Brightness applied at show-time, buffer stores full color values
 
 ## Installation
