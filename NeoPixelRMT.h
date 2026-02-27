@@ -202,13 +202,22 @@ public:
     _pixelBuffer[i * 4 + 3] = w;
   }
 
-  // Helper for direct white channel access on RGBW
+  // Helper for direct white channel access on RGBW, or RGB white on RGB LEDs
   void setPixelColorW(int i, uint8_t w) {
     if (i < 0 || i >= _numPixels || !_pixelBuffer) return;
-    _pixelBuffer[i * 4]     = 0;
-    _pixelBuffer[i * 4 + 1] = 0;
-    _pixelBuffer[i * 4 + 2] = 0;
-    _pixelBuffer[i * 4 + 3] = w;
+    if (_bytesPerLed == 4) {
+      // RGBW: use dedicated white channel
+      _pixelBuffer[i * 4]     = 0;
+      _pixelBuffer[i * 4 + 1] = 0;
+      _pixelBuffer[i * 4 + 2] = 0;
+      _pixelBuffer[i * 4 + 3] = w;
+    } else {
+      // RGB: set all channels to produce white
+      _pixelBuffer[i * 4]     = w;
+      _pixelBuffer[i * 4 + 1] = w;
+      _pixelBuffer[i * 4 + 2] = w;
+      _pixelBuffer[i * 4 + 3] = 0;
+    }
   }
 
   void setPixelColor(int i, uint32_t c) {
