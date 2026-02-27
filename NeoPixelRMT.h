@@ -147,7 +147,7 @@ public:
   void show() {
     if (!_pixelBuffer || !_txBuffer || !_channel || !_encoder) return;
 
-    // Wait for any previous transmission to complete
+    // Wait for any previous transmission to complete BEFORE we touch _txBuffer
     if (_txPending) {
       rmt_tx_wait_all_done(_channel, portMAX_DELAY);
       _txPending = false;
@@ -199,6 +199,15 @@ public:
     _pixelBuffer[i * 4]     = r;
     _pixelBuffer[i * 4 + 1] = g;
     _pixelBuffer[i * 4 + 2] = b;
+    _pixelBuffer[i * 4 + 3] = w;
+  }
+
+  // Helper for direct white channel access on RGBW
+  void setPixelColorW(int i, uint8_t w) {
+    if (i < 0 || i >= _numPixels || !_pixelBuffer) return;
+    _pixelBuffer[i * 4]     = 0;
+    _pixelBuffer[i * 4 + 1] = 0;
+    _pixelBuffer[i * 4 + 2] = 0;
     _pixelBuffer[i * 4 + 3] = w;
   }
 
