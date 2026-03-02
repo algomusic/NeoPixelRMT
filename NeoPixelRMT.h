@@ -206,10 +206,7 @@ public:
   void setPixelColorW(int i, uint8_t w) {
     if (i < 0 || i >= _numPixels || !_pixelBuffer) return;
     if (_bytesPerLed == 4) {
-      // RGBW: use dedicated white channel
-      _pixelBuffer[i * 4]     = 0;
-      _pixelBuffer[i * 4 + 1] = 0;
-      _pixelBuffer[i * 4 + 2] = 0;
+      // RGBW: set white channel, preserve existing RGB
       _pixelBuffer[i * 4 + 3] = w;
     } else {
       // RGB: set all channels to produce white
@@ -242,6 +239,24 @@ public:
     if (_pixelBuffer) memset(_pixelBuffer, 0, _numPixels * 4);
   }
 
+  // Clear only the white channel on all pixels (preserves RGB)
+  void clearWhite() {
+    if (!_pixelBuffer) return;
+    for (int i = 0; i < _numPixels; i++) {
+      _pixelBuffer[i * 4 + 3] = 0;
+    }
+  }
+
+  // Clear white channel on a range of pixels (preserves RGB)
+  void clearWhite(int from, int to) {
+    if (!_pixelBuffer) return;
+    if (from < 0) from = 0;
+    if (to > _numPixels) to = _numPixels;
+    for (int i = from; i < to; i++) {
+      _pixelBuffer[i * 4 + 3] = 0;
+    }
+  }
+
 private:
   uint16_t _numPixels;
   int _pin;
@@ -262,15 +277,18 @@ private:
     neo_enc->base.reset = neopixel_encoder_reset;
 
     // Bytes encoder: converts each byte to 8 RMT symbols (MSB first)
-    // WS2812B / SK6812 compatible timing at 10MHz (100ns/tick)
+    // SK6812 RGBW timing at 10MHz (100ns/tick)
+    // T0H: spec 200-400ns, using 300ns (typical) for margin
+    // T1H: spec 650-1000ns, using 800ns
+    // Period must be >= 1.2µs
     rmt_bytes_encoder_config_t bytes_cfg = {};
-    bytes_cfg.bit0.duration0 = 4;  // T0H: 400ns
+    bytes_cfg.bit0.duration0 = 3;  // T0H: 300ns (typ, max 400ns)
     bytes_cfg.bit0.level0 = 1;
-    bytes_cfg.bit0.duration1 = 8;  // T0L: 800ns
+    bytes_cfg.bit0.duration1 = 9;  // T0L: 900ns (min 800ns)
     bytes_cfg.bit0.level1 = 0;
-    bytes_cfg.bit1.duration0 = 8;  // T1H: 800ns
+    bytes_cfg.bit1.duration0 = 8;  // T1H: 800ns (typ 750ns, max 1000ns)
     bytes_cfg.bit1.level0 = 1;
-    bytes_cfg.bit1.duration1 = 4;  // T1L: 400ns
+    bytes_cfg.bit1.duration1 = 4;  // T1L: 400ns (min 200ns)
     bytes_cfg.bit1.level1 = 0;
     bytes_cfg.flags.msb_first = true;
 
