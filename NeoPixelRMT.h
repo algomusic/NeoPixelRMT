@@ -95,7 +95,7 @@ public:
   NeoPixelRMT(uint16_t numPixels, int pin, uint8_t colorOrder = NEO_GRB)
     : _numPixels(numPixels), _pin(pin), _colorOrder(colorOrder),
       _brightness(255), _pixelBuffer(nullptr), _txBuffer(nullptr),
-      _channel(nullptr), _encoder(nullptr), _txPending(false) {
+      _channel(nullptr), _encoder(nullptr), _txPending(false), _suppressWhite(false) {
     _bytesPerLed = (_colorOrder >= NEO_RGBW) ? 4 : 3;
   }
 
@@ -171,11 +171,11 @@ public:
           break;
         case NEO_RGBW:
           _txBuffer[txIdx++] = r; _txBuffer[txIdx++] = g;
-          _txBuffer[txIdx++] = b; _txBuffer[txIdx++] = w;
+          _txBuffer[txIdx++] = b; _txBuffer[txIdx++] = _suppressWhite ? 0 : w;
           break;
         case NEO_GRBW:
           _txBuffer[txIdx++] = g; _txBuffer[txIdx++] = r;
-          _txBuffer[txIdx++] = b; _txBuffer[txIdx++] = w;
+          _txBuffer[txIdx++] = b; _txBuffer[txIdx++] = _suppressWhite ? 0 : w;
           break;
         default:
           _txBuffer[txIdx++] = g; _txBuffer[txIdx++] = r; _txBuffer[txIdx++] = b;
@@ -193,6 +193,9 @@ public:
   void setBrightness(uint8_t b) { _brightness = b; }
 
   uint8_t getBrightness() const { return _brightness; }
+
+  // Suppress white channel on RGBW/GRBW LEDs — forces W=0 in TX buffer
+  void setSuppressWhite(bool suppress) { _suppressWhite = suppress; }
 
   void setPixelColor(int i, uint8_t r, uint8_t g, uint8_t b, uint8_t w = 0) {
     if (i < 0 || i >= _numPixels || !_pixelBuffer) return;
@@ -268,6 +271,7 @@ private:
   rmt_channel_handle_t _channel;
   rmt_encoder_t* _encoder;
   bool _txPending;
+  bool _suppressWhite;
 
   void _createEncoder() {
     neopixel_encoder_t *neo_enc = (neopixel_encoder_t*)calloc(1, sizeof(neopixel_encoder_t));
