@@ -1,9 +1,9 @@
 /*
-  NeoPixelRMT.h - Non-blocking NeoPixel driver using ESP32 RMT hardware with DMA
+  NeoPixelRMT.h - Non-blocking NeoPixel driver using ESP32 RMT hardware
 
-  Uses the ESP32-S3's RMT peripheral with DMA for glitch-free async LED
-  transmission. DMA bypasses the interrupt-driven FIFO ping-pong that causes
-  LED flicker when interrupts are delayed (e.g., by WiFi, audio, or other ISRs).
+  Uses the ESP32-S3's RMT peripheral for async LED transmission.
+  Pre-builds the complete RMT symbol buffer before transmission to eliminate
+  FIFO underrun gaps that can cause data corruption on marginal signal lines.
 
   Drop-in replacement for Adafruit_NeoPixel with compatible API.
 
@@ -24,69 +24,30 @@
 #define NEO_RGBW 2
 #define NEO_GRBW 3
 
-// ---- Custom RMT encoder for NeoPixel byte data ----
-// This encodes raw pixel bytes into RMT symbols on-the-fly,
-// so the DMA feeds symbols directly without a pre-built buffer.
+// ---- Simple copy encoder: sends a pre-built rmt_symbol_word_t buffer as-is ----
 
 typedef struct {
   rmt_encoder_t base;
-  rmt_encoder_t *bytes_encoder;
   rmt_encoder_t *copy_encoder;
-  int state;
-  rmt_symbol_word_t reset_code;
-} neopixel_encoder_t;
+} neopixel_copy_encoder_t;
 
-static size_t neopixel_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel,
-                               const void *primary_data, size_t data_size,
-                               rmt_encode_state_t *ret_state) {
-  neopixel_encoder_t *neo_enc = __containerof(encoder, neopixel_encoder_t, base);
-  rmt_encode_state_t session_state = RMT_ENCODING_RESET;
-  rmt_encode_state_t state = RMT_ENCODING_RESET;
-  size_t encoded_symbols = 0;
-
-  switch (neo_enc->state) {
-    case 0: // encode pixel data
-      encoded_symbols += neo_enc->bytes_encoder->encode(
-        neo_enc->bytes_encoder, channel, primary_data, data_size, &session_state);
-      if (session_state & RMT_ENCODING_COMPLETE) {
-        neo_enc->state = 1; // move to reset code
-      }
-      if (session_state & RMT_ENCODING_MEM_FULL) {
-        state = (rmt_encode_state_t)(state | RMT_ENCODING_MEM_FULL);
-        *ret_state = state;
-        return encoded_symbols;
-      }
-      // fall through to send reset
-    case 1: // send reset code (low for >80us)
-      encoded_symbols += neo_enc->copy_encoder->encode(
-        neo_enc->copy_encoder, channel, &neo_enc->reset_code,
-        sizeof(rmt_symbol_word_t), &session_state);
-      if (session_state & RMT_ENCODING_COMPLETE) {
-        neo_enc->state = RMT_ENCODING_RESET; // back to initial state
-        state = (rmt_encode_state_t)(state | RMT_ENCODING_COMPLETE);
-      }
-      if (session_state & RMT_ENCODING_MEM_FULL) {
-        state = (rmt_encode_state_t)(state | RMT_ENCODING_MEM_FULL);
-      }
-      break;
-  }
-  *ret_state = state;
-  return encoded_symbols;
+static size_t neopixel_copy_encode(rmt_encoder_t *encoder, rmt_channel_handle_t channel,
+                                    const void *primary_data, size_t data_size,
+                                    rmt_encode_state_t *ret_state) {
+  neopixel_copy_encoder_t *enc = __containerof(encoder, neopixel_copy_encoder_t, base);
+  return enc->copy_encoder->encode(enc->copy_encoder, channel, primary_data, data_size, ret_state);
 }
 
-static esp_err_t neopixel_encoder_del(rmt_encoder_t *encoder) {
-  neopixel_encoder_t *neo_enc = __containerof(encoder, neopixel_encoder_t, base);
-  rmt_del_encoder(neo_enc->bytes_encoder);
-  rmt_del_encoder(neo_enc->copy_encoder);
-  free(neo_enc);
+static esp_err_t neopixel_copy_encoder_del(rmt_encoder_t *encoder) {
+  neopixel_copy_encoder_t *enc = __containerof(encoder, neopixel_copy_encoder_t, base);
+  rmt_del_encoder(enc->copy_encoder);
+  free(enc);
   return ESP_OK;
 }
 
-static esp_err_t neopixel_encoder_reset(rmt_encoder_t *encoder) {
-  neopixel_encoder_t *neo_enc = __containerof(encoder, neopixel_encoder_t, base);
-  rmt_encoder_reset(neo_enc->bytes_encoder);
-  rmt_encoder_reset(neo_enc->copy_encoder);
-  neo_enc->state = RMT_ENCODING_RESET;
+static esp_err_t neopixel_copy_encoder_reset(rmt_encoder_t *encoder) {
+  neopixel_copy_encoder_t *enc = __containerof(encoder, neopixel_copy_encoder_t, base);
+  rmt_encoder_reset(enc->copy_encoder);
   return ESP_OK;
 }
 
@@ -94,8 +55,10 @@ class NeoPixelRMT {
 public:
   NeoPixelRMT(uint16_t numPixels, int pin, uint8_t colorOrder = NEO_GRB)
     : _numPixels(numPixels), _pin(pin), _colorOrder(colorOrder),
-      _brightness(255), _pixelBuffer(nullptr), _txBuffer(nullptr),
-      _channel(nullptr), _encoder(nullptr), _txPending(false), _suppressWhite(false) {
+      _brightness(255), _pixelBuffer(nullptr), _rmtSymbols(nullptr),
+      _channel(nullptr), _encoder(nullptr), _txPending(false),
+      _suppressWhite(false), _dynamicCap(false), _maxChannelVal(255),
+      _capHeadroom(2.0f) {
     _bytesPerLed = (_colorOrder >= NEO_RGBW) ? 4 : 3;
   }
 
@@ -106,96 +69,124 @@ public:
       rmt_del_channel(_channel);
     }
     if (_pixelBuffer) free(_pixelBuffer);
-    if (_txBuffer) free(_txBuffer);
+    if (_rmtSymbols) free(_rmtSymbols);
   }
 
   void begin() {
     // Allocate pixel buffer (always 4 bytes per pixel for uniform indexing)
     _pixelBuffer = (uint8_t*)calloc(_numPixels * 4, sizeof(uint8_t));
-    // TX buffer holds the reordered/brightness-adjusted bytes for transmission
-    _txBuffer = (uint8_t*)calloc(_numPixels * _bytesPerLed, sizeof(uint8_t));
 
-    // Configure RMT TX channel with DMA for glitch-free transmission
+    // Pre-allocate RMT symbol buffer: 8 symbols per byte + 1 reset symbol
+    _numSymbols = _numPixels * _bytesPerLed * 8 + 1;
+    _rmtSymbols = (rmt_symbol_word_t*)calloc(_numSymbols, sizeof(rmt_symbol_word_t));
+
+    // Set up timing constants (SK6812 at 10MHz = 100ns/tick)
+    // Slower period (1.4µs vs 1.2µs min) for signal settling on marginal voltage lines
+    _bit0.duration0 = 4;   // T0H: 400ns
+    _bit0.level0 = 1;
+    _bit0.duration1 = 10;  // T0L: 1000ns
+    _bit0.level1 = 0;
+    _bit1.duration0 = 8;   // T1H: 800ns
+    _bit1.level0 = 1;
+    _bit1.duration1 = 6;   // T1L: 600ns
+    _bit1.level1 = 0;
+
+    // Configure RMT TX channel — non-DMA to avoid bus contention with I2S audio DMA
+    // Still non-blocking: show() returns immediately, RMT transmits via FIFO refill
     rmt_tx_channel_config_t tx_cfg = {};
     tx_cfg.gpio_num = (gpio_num_t)_pin;
     tx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
     tx_cfg.resolution_hz = 10000000; // 10MHz = 100ns per tick
-    tx_cfg.mem_block_symbols = 1024; // DMA buffer size (recommended by Espressif)
+    tx_cfg.mem_block_symbols = 192;  // 4 blocks × 48 symbols
     tx_cfg.trans_queue_depth = 1;
-    tx_cfg.flags.with_dma = true; // Enable DMA - bypasses interrupt-driven FIFO refill
-    // tx_cfg.flags.invert_out = false;
-    // tx_cfg.flags.io_loop_back = false;
-    // tx_cfg.flags.io_od_mode = false;
-    // tx_cfg.flags.allow_pd = false;
+    tx_cfg.flags.with_dma = false;
 
     esp_err_t err = rmt_new_tx_channel(&tx_cfg, &_channel);
     if (err != ESP_OK) {
-      // DMA failed (maybe only 1 DMA channel available and already in use)
-      // Fall back to non-DMA with maximum memory blocks
-      tx_cfg.flags.with_dma = false;
-      tx_cfg.mem_block_symbols = 192; // 4 blocks x 48 symbols
+      tx_cfg.mem_block_symbols = 48; // 1 block fallback
       rmt_new_tx_channel(&tx_cfg, &_channel);
     }
 
-    // Create the NeoPixel encoder (bytes encoder + reset code)
-    _createEncoder();
+    // Create a simple copy encoder — just sends our pre-built symbol buffer
+    _createCopyEncoder();
 
-    // Enable the channel
     rmt_enable(_channel);
   }
 
   void show() {
-    if (!_pixelBuffer || !_txBuffer || !_channel || !_encoder) return;
+    if (!_pixelBuffer || !_rmtSymbols || !_channel || !_encoder) return;
 
-    // Wait for any previous transmission to complete BEFORE we touch _txBuffer
+    // Wait for any previous transmission to complete
     if (_txPending) {
       rmt_tx_wait_all_done(_channel, portMAX_DELAY);
       _txPending = false;
     }
 
-    // Build TX buffer: apply brightness and reorder bytes
-    int txIdx = 0;
+    // Build the complete RMT symbol buffer from pixel data
+    int symIdx = 0;
     for (int led = 0; led < _numPixels; led++) {
       uint8_t* px = &_pixelBuffer[led * 4];
-      uint8_t r = (px[0] * _brightness) >> 8;
-      uint8_t g = (px[1] * _brightness) >> 8;
-      uint8_t b = (px[2] * _brightness) >> 8;
-      uint8_t w = (px[3] * _brightness) >> 8;
+      uint8_t r = min((uint8_t)((px[0] * _brightness) >> 8), _maxChannelVal);
+      uint8_t g = min((uint8_t)((px[1] * _brightness) >> 8), _maxChannelVal);
+      uint8_t b = min((uint8_t)((px[2] * _brightness) >> 8), _maxChannelVal);
+      uint8_t w = _suppressWhite ? 0 : min((uint8_t)((px[3] * _brightness) >> 8), _maxChannelVal);
 
+      // Encode bytes in color order
       switch (_colorOrder) {
         case NEO_RGB:
-          _txBuffer[txIdx++] = r; _txBuffer[txIdx++] = g; _txBuffer[txIdx++] = b;
+          _encodeByte(r, symIdx); _encodeByte(g, symIdx); _encodeByte(b, symIdx);
           break;
         case NEO_GRB:
-          _txBuffer[txIdx++] = g; _txBuffer[txIdx++] = r; _txBuffer[txIdx++] = b;
+          _encodeByte(g, symIdx); _encodeByte(r, symIdx); _encodeByte(b, symIdx);
           break;
         case NEO_RGBW:
-          _txBuffer[txIdx++] = r; _txBuffer[txIdx++] = g;
-          _txBuffer[txIdx++] = b; _txBuffer[txIdx++] = _suppressWhite ? 0 : w;
+          _encodeByte(r, symIdx); _encodeByte(g, symIdx);
+          _encodeByte(b, symIdx); _encodeByte(w, symIdx);
           break;
         case NEO_GRBW:
-          _txBuffer[txIdx++] = g; _txBuffer[txIdx++] = r;
-          _txBuffer[txIdx++] = b; _txBuffer[txIdx++] = _suppressWhite ? 0 : w;
+          _encodeByte(g, symIdx); _encodeByte(r, symIdx);
+          _encodeByte(b, symIdx); _encodeByte(w, symIdx);
           break;
         default:
-          _txBuffer[txIdx++] = g; _txBuffer[txIdx++] = r; _txBuffer[txIdx++] = b;
+          _encodeByte(g, symIdx); _encodeByte(r, symIdx); _encodeByte(b, symIdx);
           break;
       }
     }
 
-    // Transmit via RMT with DMA - non-blocking, returns immediately
+    // Append reset code (280µs low)
+    _rmtSymbols[symIdx].duration0 = 2800;
+    _rmtSymbols[symIdx].level0 = 0;
+    _rmtSymbols[symIdx].duration1 = 0;
+    _rmtSymbols[symIdx].level1 = 0;
+    symIdx++;
+
+    // Transmit — non-blocking, returns immediately
     rmt_transmit_config_t tx_config = {};
-    tx_config.loop_count = 0; // no loop
-    rmt_transmit(_channel, _encoder, _txBuffer, _numPixels * _bytesPerLed, &tx_config);
+    tx_config.loop_count = 0;
+    rmt_transmit(_channel, _encoder, _rmtSymbols, symIdx * sizeof(rmt_symbol_word_t), &tx_config);
     _txPending = true;
   }
 
-  void setBrightness(uint8_t b) { _brightness = b; }
+  void setBrightness(uint8_t b) {
+    _brightness = b;
+    if (_dynamicCap) _updateMaxChannel();
+  }
 
   uint8_t getBrightness() const { return _brightness; }
 
   // Suppress white channel on RGBW/GRBW LEDs — forces W=0 in TX buffer
   void setSuppressWhite(bool suppress) { _suppressWhite = suppress; }
+
+  // Cap per-channel output value (0-255) to limit max brightness in TX buffer
+  void setMaxChannelValue(uint8_t maxVal) { _maxChannelVal = maxVal; _dynamicCap = false; }
+
+  // Auto-cap: keeps _maxChannelVal at headroom above max possible output for current brightness
+  // headroom is a multiplier (e.g. 2.0 = cap at 2x the max normal output)
+  void setDynamicChannelCap(float headroom = 2.0f) {
+    _dynamicCap = true;
+    _capHeadroom = headroom;
+    _updateMaxChannel();
+  }
 
   void setPixelColor(int i, uint8_t r, uint8_t g, uint8_t b, uint8_t w = 0) {
     if (i < 0 || i >= _numPixels || !_pixelBuffer) return;
@@ -267,49 +258,41 @@ private:
   uint8_t _brightness;
   uint8_t _bytesPerLed;
   uint8_t* _pixelBuffer;
-  uint8_t* _txBuffer;
+  rmt_symbol_word_t* _rmtSymbols;  // Pre-built symbol buffer
+  uint32_t _numSymbols;
+  rmt_symbol_word_t _bit0;         // Cached timing for bit 0
+  rmt_symbol_word_t _bit1;         // Cached timing for bit 1
   rmt_channel_handle_t _channel;
   rmt_encoder_t* _encoder;
   bool _txPending;
   bool _suppressWhite;
+  bool _dynamicCap;
+  uint8_t _maxChannelVal;
+  float _capHeadroom;
 
-  void _createEncoder() {
-    neopixel_encoder_t *neo_enc = (neopixel_encoder_t*)calloc(1, sizeof(neopixel_encoder_t));
+  void _updateMaxChannel() {
+    uint16_t maxOut = (255 * (uint16_t)_brightness) >> 8;
+    uint16_t cap = (uint16_t)(maxOut * _capHeadroom);
+    _maxChannelVal = cap > 255 ? 255 : (uint8_t)cap;
+  }
 
-    neo_enc->base.encode = neopixel_encode;
-    neo_enc->base.del = neopixel_encoder_del;
-    neo_enc->base.reset = neopixel_encoder_reset;
+  // Encode one byte (8 bits, MSB first) into 8 RMT symbols
+  inline void _encodeByte(uint8_t val, int &symIdx) {
+    for (int bit = 7; bit >= 0; bit--) {
+      _rmtSymbols[symIdx++] = (val & (1 << bit)) ? _bit1 : _bit0;
+    }
+  }
 
-    // Bytes encoder: converts each byte to 8 RMT symbols (MSB first)
-    // SK6812 RGBW timing at 10MHz (100ns/tick)
-    // T0H: spec 200-400ns, using 300ns (typical) for margin
-    // T1H: spec 650-1000ns, using 800ns
-    // Period must be >= 1.2µs
-    rmt_bytes_encoder_config_t bytes_cfg = {};
-    bytes_cfg.bit0.duration0 = 3;  // T0H: 300ns (typ, max 400ns)
-    bytes_cfg.bit0.level0 = 1;
-    bytes_cfg.bit0.duration1 = 9;  // T0L: 900ns (min 800ns)
-    bytes_cfg.bit0.level1 = 0;
-    bytes_cfg.bit1.duration0 = 8;  // T1H: 800ns (typ 750ns, max 1000ns)
-    bytes_cfg.bit1.level0 = 1;
-    bytes_cfg.bit1.duration1 = 4;  // T1L: 400ns (min 200ns)
-    bytes_cfg.bit1.level1 = 0;
-    bytes_cfg.flags.msb_first = true;
+  void _createCopyEncoder() {
+    neopixel_copy_encoder_t *enc = (neopixel_copy_encoder_t*)calloc(1, sizeof(neopixel_copy_encoder_t));
+    enc->base.encode = neopixel_copy_encode;
+    enc->base.del = neopixel_copy_encoder_del;
+    enc->base.reset = neopixel_copy_encoder_reset;
 
-    rmt_new_bytes_encoder(&bytes_cfg, &neo_enc->bytes_encoder);
-
-    // Copy encoder for the reset code (low for 280us = 2800 ticks at 10MHz)
     rmt_copy_encoder_config_t copy_cfg = {};
-    rmt_new_copy_encoder(&copy_cfg, &neo_enc->copy_encoder);
+    rmt_new_copy_encoder(&copy_cfg, &enc->copy_encoder);
 
-    neo_enc->reset_code.duration0 = 2800; // 280us low (reset signal)
-    neo_enc->reset_code.level0 = 0;
-    neo_enc->reset_code.duration1 = 0;
-    neo_enc->reset_code.level1 = 0;
-
-    neo_enc->state = RMT_ENCODING_RESET;
-
-    _encoder = &neo_enc->base;
+    _encoder = &enc->base;
   }
 };
 
